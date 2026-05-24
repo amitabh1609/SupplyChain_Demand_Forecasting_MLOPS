@@ -2,7 +2,6 @@
 
 > Predicting spare-parts demand across 500 SKUs — with full MLOps infrastructure, drift monitoring, and a production-ready FastAPI serving layer.
 
-**Amitabh Choudhury · ML Engineer Portfolio · Project 2 of 3**
 
 ---
 
