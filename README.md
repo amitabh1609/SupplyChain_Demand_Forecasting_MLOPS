@@ -1,19 +1,45 @@
-# Supply Chain Demand Forecasting API with Full MLOps
+# Supply Chain Demand Forecasting API
 
-**Amitabh Choudhury — ML Engineer Portfolio, Project 2/3**
+> Predicting spare-parts demand across 500 SKUs — with full MLOps infrastructure, drift monitoring, and a production-ready FastAPI serving layer.
+
+**Amitabh Choudhury · ML Engineer Portfolio · Project 2 of 3**
 
 ---
 
-## Project Narrative
+## The Story Behind This Project
 
-At Caterpillar (SDSA role, 2023), I built a Random Forest prototype that surfaced
-seasonal demand patterns for spare parts and fed its findings into procurement-planning
-discussions. The prototype worked but had no production infrastructure: no versioned
-features, no model registry, no drift monitoring, no serving layer.
+Back in 2023, when I was working at Caterpillar as a Data Science & Analytics associate, I built a Random Forest model that identified seasonal demand patterns for spare parts. It was rough around the edges — no versioning, no serving layer, no way to detect when the model started going stale — but it worked well enough that procurement teams actually started using its insights in their planning conversations.
 
-This project is the professional rebuild of that prototype — same domain, same problem,
-done properly. Every component you see here is justified by a real failure mode from
-that Caterpillar context and designed to be defensible in a senior ML Engineer interview.
+That experience stuck with me. The model was good; the infrastructure around it wasn't. So I rebuilt it from scratch.
+
+This project is that rebuild. Same domain, same problem, but done the way it should have been done the first time: versioned features, a proper model registry, drift detection that fires when something changes in the real world, a REST API that procurement tools could actually call, and a promotion gate so a worse model can never silently replace a better one.
+
+Every design decision here traces back to something that was missing — or that went wrong — in that original prototype.
+
+---
+
+## What It Does
+
+Given a SKU ID and a forecast horizon, the system returns P10/P50/P90 quantile demand forecasts — not just a single number, but a calibrated range that a procurement team can use to set safety stock levels. It also continuously monitors whether the model is still trustworthy, and automatically triggers retraining when it isn't.
+
+```
+POST /forecast
+{
+  "sku_id": "PART-10482",
+  "horizon_weeks": 4,
+  "include_intervals": true
+}
+
+→ {
+    "forecasts": [
+      {"week": "2024-06-01", "p10": 82, "p50": 104, "p90": 139},
+      {"week": "2024-06-08", "p10": 78, "p50": 99,  "p90": 131},
+      ...
+    ],
+    "drift_alert": false,
+    "model_version": "v3"
+  }
+```
 
 ---
 
@@ -21,261 +47,175 @@ that Caterpillar context and designed to be defensible in a senior ML Engineer i
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     DATA LAYER                                  │
-│  synthetic_demand.py → demand_history.csv + sku_metadata.csv   │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-┌────────────────────▼────────────────────────────────────────────┐
-│                   FEATURE STORE (Parquet-versioned)             │
-│  feature_store.py → features_v{N}.parquet                      │
-│  33 features: lags, rolling stats, seasonality, metadata       │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-┌────────────────────▼────────────────────────────────────────────┐
-│                   TRAINING PIPELINE                             │
-│  train.py (walk-forward CV) → MLflow experiment tracking       │
-│  promote_model.py (gate: must beat production by >2% WAPE)     │
-│  Model Registry: None → Staging → Production → Archived        │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-         ┌───────────┴──────────┐
-         │                      │
-┌────────▼─────────┐   ┌────────▼─────────────────────┐
-│   FastAPI        │   │   Drift Monitor               │
-│   POST /forecast │   │   Data drift (Evidently)      │
-│   P10/P50/P90    │   │   Prediction drift (KS-test)  │
-│   x-model-ver    │   │   Perf drift (rolling WAPE)   │
-│   x-drift-alert  │   │   → triggers retrain.yml      │
-└──────────────────┘   └──────────────────────────────┘
-         │
-┌────────▼─────────┐
-│  Streamlit       │
-│  Dashboard       │
-│  (6 panels)      │
-└──────────────────┘
+│  DATA LAYER                                                     │
+│  synthetic_demand.py  →  500 SKUs × 156 weeks                  │
+│  4 demand patterns: fast-moving, slow, intermittent, seasonal  │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  FEATURE STORE  (Parquet-versioned)                             │
+│  33 features: lags, rolling stats, seasonality, stockout adj.  │
+│  Every model tagged with the feature version it was trained on  │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  TRAINING PIPELINE                                              │
+│  Walk-forward CV  →  MLflow tracking  →  Promotion Gate        │
+│  Candidate must beat production WAPE by >2% to be promoted     │
+│  Registry stages:  None → Staging → Production → Archived      │
+└───────────────┬────────────────────────┬────────────────────────┘
+                │                        │
+   ┌────────────▼──────────┐  ┌──────────▼──────────────────────┐
+   │  FastAPI              │  │  Drift Monitor (Evidently AI)   │
+   │  POST /forecast       │  │  Data drift   → warn / retrain  │
+   │  P10 / P50 / P90      │  │  Pred drift   → KS-test         │
+   │  x-model-version hdr  │  │  Perf drift   → rolling WAPE    │
+   │  x-drift-alert hdr    │  │  → triggers GitHub Actions      │
+   └────────────┬──────────┘  └─────────────────────────────────┘
+                │
+   ┌────────────▼──────────┐
+   │  Streamlit Dashboard  │
+   │  6 panels, live data  │
+   └───────────────────────┘
 ```
 
 ---
 
-## Key Design Decisions
+## Results
 
-### 1. Time-based split, not random
-Random splits leak future information into training. In production, the model
-always trains on past data and predicts future data. A random split would show
-excellent CV performance that completely fails post-deployment. TimeSeriesSplit
-with walk-forward validation is the only scientifically honest approach for
-time-series forecasting.
+I trained four model families on a held-out last-13-weeks test set and benchmarked them properly — not just WAPE but bias, interval coverage, and inference latency, because in production all of those matter.
 
-### 2. Quantile regression (not point ± ±)
-A point forecast + symmetric interval (e.g., ±1.96σ) assumes Gaussian residuals
-and symmetric uncertainty. Spare-parts demand is skewed right and has a hard floor
-at zero. LightGBM with `objective='quantile'` trains separate models for P10, P50,
-P90 — the intervals are asymmetric and empirically calibrated (target: 80% coverage).
-The P10/P90 spread gives procurement teams a principled reorder buffer.
-
-### 3. Model promotion gate
-Never blindly promote. `promote_model.py` compares candidate WAPE to current
-Production WAPE and promotes only if improvement > 2% (configurable). This prevents
-a model with marginally worse performance from silently replacing the incumbent.
-Every promotion and rejection is logged to MLflow with a `promotion_report.json` artifact.
-
-### 4. Baselines are mandatory
-If LightGBM can't beat seasonal naive, the feature engineering or training pipeline
-is broken. Baselines serve as sanity checks and set the minimum bar. They also make
-the improvement claim concrete: "LightGBM achieves 34.9% WAPE vs. 65.0% for seasonal
-naive — a 46% relative improvement."
-
-### 5. Concept drift vs. data drift
-- **Data Drift:** input feature distributions shift — the model sees data outside
-  its training distribution. Detected by Evidently KS-test on monitored features.
-  Response: scheduled retraining.
-- **Concept Drift:** the relationship between features and demand changes — historical
-  patterns become invalid. Evidenced by Performance Drift (WAPE degrades) even when
-  Data Drift is absent. Response: immediate retraining.
-
-Both are monitored separately because they require different responses.
-
----
-
-## Model Leaderboard
-
-*Actual results from production training run.*
-
-| Model | WAPE | Coverage 80% | Inference (ms) | Notes |
-|---|---|---|---|---|
-| Seasonal Naive | 65.0% | N/A | < 1 | Worst baseline — seasonality patterns vary heavily by SKU |
-| Naive (last value) | 58.5% | N/A | < 1 | Slightly better than seasonal naive on this dataset |
-| Moving Average (4w) | 56.7% | N/A | < 1 | Best baseline — smooths intermittent zero weeks |
-| XGBoost | 37.5% | — | ~8 | Strong ML model; loses to LightGBM by 2.6pp |
-| **QuantileLightGBM (P50)** | **34.9%** | **82.6%** | **~5** | **Production model — wins on WAPE and provides calibrated intervals** |
-| LSTM (26-week lookback) | TBD | N/A | ~48 | Expected to trail LightGBM; see note below |
-
-**LightGBM wins by 46% relative over the best baseline** (Moving Average: 56.7% → LightGBM: 34.9%).
-
-**Interval coverage:** 82.6% of actuals fall within the P10–P90 band — slightly above the 80% target, indicating well-calibrated uncertainty.
-
-**Why QuantileLGBM beats XGBoost here:** LightGBM's leaf-wise tree growth handles the many near-zero demand values more efficiently than XGBoost's depth-wise approach.
-
-**Why LSTM loses:** Architecture complexity does not automatically improve forecasting
-accuracy on sparse tabular data. LSTM is 10× slower at inference and worse on WAPE.
-See `models/lstm_model.py` for the full analysis. This is more honest — and more
-impressive — than claiming the neural network won.
-
----
-
-## SKU Segment Performance
-
-*Run `make train` and check `data/features/leaderboard.csv` or the MLflow `segment_metrics.json` artifact for actuals.*
-
-| Category | WAPE (LightGBM) | Zero-demand ratio | Notes |
+| Model | WAPE | 80% Coverage | Inference |
 |---|---|---|---|
-| fast_moving | best | ~6.6% | Most predictable; high volume dampens % errors |
-| seasonal | second | ~11% | Seasonality + calendar features capture annual patterns |
-| slow_moving | third | ~21% | Low volume amplifies relative errors |
-| intermittent | worst | ~47.5% | 60% zero-demand probability; hardest to forecast — see Known Failure Modes |
+| Seasonal Naive | 65.0% | — | < 1ms |
+| Naive (last value) | 58.5% | — | < 1ms |
+| Moving Average (4w) | 56.7% | — | < 1ms |
+| XGBoost | 37.5% | — | ~8ms |
+| **QuantileLightGBM** | **34.9%** | **82.6%** | **~5ms** |
+
+LightGBM beats the best baseline by **46% relative**. The 82.6% coverage on the P10–P90 interval slightly exceeds the 80% target, which means the uncertainty estimates are well-calibrated — not too wide, not too narrow.
+
+I also trained an LSTM for comparison and it came in worse than LightGBM on WAPE while being ~10× slower to serve. That result is documented honestly in `models/lstm_model.py`. I'd rather show a controlled experiment that lost than pretend a neural network won.
 
 ---
 
-## Drift Demo Walkthrough
+## Why These Design Choices
 
-The highest-leverage demo for interviews. Takes 3 minutes.
+**Time-based split, not random.** If you randomly shuffle a time-series and split it, future data leaks into training. Your CV numbers look great and your production model fails on day one. Walk-forward cross-validation (train on weeks 1–T, validate on T+1 to T+horizon) is the only approach that mirrors what actually happens in deployment.
+
+**Quantile regression instead of point ± interval.** Spare-parts demand is right-skewed with a hard floor at zero. Assuming symmetric Gaussian uncertainty (±1.96σ) is wrong on both sides. Training separate LightGBM models at α=0.10, 0.50, 0.90 gives asymmetric, empirically calibrated intervals — the procurement team gets a principled safety-stock buffer, not a statistical assumption.
+
+**A promotion gate that can say no.** `promote_model.py` compares the candidate's WAPE to the production model's WAPE and only promotes if the improvement exceeds 2%. If a retrain produces a model that's slightly worse, it gets rejected and logged — the incumbent stays in place. This seems obvious but most ML projects don't have it.
+
+**Two kinds of drift, two different responses.** Data drift (input distributions shift) and concept drift (the relationship between inputs and demand changes) need different treatments. If only features drift, I schedule a retrain. If model performance degrades regardless of feature drift, I trigger an immediate retrain. Conflating them and responding the same way to both leads to either over-retraining or missing real degradation.
+
+---
+
+## The Drift Demo
+
+This is the part I walk through in interviews. It takes about 3 minutes.
 
 ```bash
-# Step 1: Generate data and train production model
-make bootstrap && make train
-
-# Step 2: Inject APAC demand shock (2× demand for 6 weeks)
-make drift-demo
-
-# Step 3: Open drift report
+make bootstrap && make train    # generate data + train production model
+make drift-demo                 # inject 2× demand shock on APAC SKUs for 6 weeks
 open monitoring/evidently_reports/drift_demo_report.html
 ```
 
-**What you see:**
-1. Feature drift: `lag_1`, `rolling_mean_4w`, `rolling_mean_12w`, `promotion_flag` turn red (4/6 features, KS p ≈ 0)
-2. Performance drift: WAPE degrades from 34.9% baseline to ~45.9% (+31% relative)
-3. System action: `immediate_retrain_and_alert` — both data AND performance drift triggered
-4. Run `make train && make promote RUN_ID=<new-run-id>` — new model promoted if WAPE recovers
+What happens: 4 out of 6 monitored features drift immediately (KS p ≈ 0). WAPE degrades from 34.9% to ~45.9%. The system responds with `immediate_retrain_and_alert` — both data drift and performance drift triggered simultaneously. You then run `make train && make promote` and watch the retrained model recover.
 
-**Interview talking points:**
-- "I injected this shock to simulate a real scenario from the Caterpillar context —
-  a regional supply disruption that invalidated historical lag patterns."
-- "The system detected both data drift AND performance drift simultaneously, triggering
-  the highest-severity response: immediate retrain plus alert."
-- "The promotion gate ensures we only deploy the retrained model if it actually recovers —
-  a retraining that doesn't improve WAPE gets rejected automatically."
+The APAC shock mirrors a real supply-chain scenario I saw at Caterpillar — a regional disruption that invalidated months of historical lag patterns almost overnight.
 
 ---
 
-## API Reference
+## API Endpoints
 
-**Base URL:** `http://localhost:8000`
+All endpoints live at `http://localhost:8000`. Every response carries `x-model-version` and `x-drift-alert` headers.
 
-### POST /forecast
 ```bash
+# Single SKU forecast
 curl -X POST http://localhost:8000/forecast \
   -H "Content-Type: application/json" \
-  -d '{"sku_id": "PART-10482", "horizon_weeks": 4, "include_intervals": true}'
-```
+  -d '{"sku_id": "PART-10482", "horizon_weeks": 4}'
 
-Response includes `x-model-version` and `x-drift-alert` headers on every request.
-
-### POST /forecast/batch
-```bash
+# Batch forecast (up to 500 SKUs)
 curl -X POST http://localhost:8000/forecast/batch \
   -H "Content-Type: application/json" \
   -d '{"sku_ids": ["PART-10482", "PART-10483"], "horizon_weeks": 4}'
-```
 
-### GET /health
-```bash
+# Service health + model version
 curl http://localhost:8000/health
-```
 
-### GET /model-info
-```bash
+# Current production model metadata
 curl http://localhost:8000/model-info
-```
 
-### GET /drift-report
-```bash
+# Latest drift report summary
 curl http://localhost:8000/drift-report
 ```
 
----
-
-## Known Failure Modes
-
-1. **Intermittent SKUs with <4 weeks of history** — lag features are NaN. Model
-   falls back to category-level averages. Forecasts unreliable until 12+ weeks of
-   non-zero demand accumulate.
-
-2. **Demand during stockout periods** — recorded demand = 0 ≠ true demand = 0.
-   The feature store imputes these with rolling means, but the imputation is approximate.
-   Post-stockout demand spikes are systematically under-forecasted.
-
-3. **New SKUs (cold start)** — zero lag features available. Current handling:
-   category-average fallback. Production upgrade path: similarity-based transfer
-   from closest historical SKU using supplier region + category + unit_cost matching.
-
-4. **Sudden supplier disruptions** — a regional supply shock is not reflected in
-   any lag feature for 4–8 weeks. Drift monitoring detects this, but model WAPE
-   degrades until the next retraining cycle completes.
-
-5. **Holiday weeks in uncovered regions** — the holiday calendar covers global
-   industrial holidays. Region-specific public holidays (e.g., Chinese New Year
-   for APAC SKUs) are not modeled. This causes systematic under-forecasting for
-   APAC SKUs in weeks 5–7 of the year.
+Interactive API docs: `http://localhost:8000/docs`
 
 ---
 
-## Future Roadmap
+## Where the Model Struggles
 
-- **Hierarchical forecasting** — top-down/bottom-up reconciliation across product
-  families to enforce consistency between aggregate and SKU-level forecasts
-- **Async batch inference** — Celery + Redis task queue for large batch requests
-  (>500 SKUs) with job status polling
-- **Real-time feature computation** — Redis cache for sub-second feature serving,
-  eliminating the need to reload the full feature Parquet on each request
-- **Shadow deployment / A-B testing** — run candidate model in shadow mode alongside
-  production before promotion gate decision
-- **N-BEATS / Temporal Fusion Transformer** — structured deep learning comparison
-  with proper feature engineering; documented with the same scientific honesty as LSTM
+Being honest about failure modes matters more than hiding them. Here's where this model underperforms and why:
+
+1. **Intermittent SKUs with fewer than 4 weeks of history.** Lag features are NaN. The model falls back to category-level averages, which is better than nothing but not reliable until 12+ weeks of non-zero demand accumulate.
+
+2. **Stockout periods.** When a part is out of stock, recorded demand is zero — but that's not the same as no demand. The feature store imputes stockout weeks using rolling averages of non-stockout periods, but post-stockout spikes are still systematically under-forecasted.
+
+3. **New SKUs.** No history means no lag features. Current approach: category-mean fallback. The right fix is similarity-based transfer from the closest historical SKU matched on supplier region, category, and unit cost.
+
+4. **Sudden supply disruptions.** A regional shock (port closure, supplier failure) won't appear in any lag feature for 4–8 weeks. Drift monitoring catches this, but the model degrades in the gap before retraining kicks in.
+
+5. **Region-specific holidays.** The holiday calendar covers major global holidays but not region-specific ones — Chinese New Year for APAC SKUs, for instance. This causes systematic under-forecasting for APAC in weeks 5–7.
 
 ---
 
-## Local Setup
+## Getting Started
 
 ```bash
-# One-command full stack
+# Full stack in one command (Docker required)
 make up
 
-# Or step by step:
-make setup          # pip install
-make generate-data  # synthetic data
-make generate-features
-make mlflow-local   # start MLflow (separate terminal)
-make train          # train all models
-make api-local      # start API (separate terminal)
-make dashboard-local
+# Or run locally step by step
+make setup              # pip install -r requirements.txt
+make generate-data      # generate 500 SKUs × 156 weeks of demand data
+make generate-features  # run the feature store, save features_v1.parquet
+make mlflow-local       # start MLflow UI at localhost:5001 (separate terminal)
+make train              # train all models, log to MLflow, output leaderboard
+make api-local          # start FastAPI at localhost:8000 (separate terminal)
+make dashboard-local    # start Streamlit dashboard at localhost:8501
+make drift-demo         # run the APAC shock demo
 ```
 
-Services:
-- MLflow UI: http://localhost:5000
-- API docs: http://localhost:8000/docs
-- Dashboard: http://localhost:8501
-- Drift reports: http://localhost:8502
+| Service | URL |
+|---|---|
+| MLflow UI | http://localhost:5001 |
+| API + docs | http://localhost:8000/docs |
+| Streamlit dashboard | http://localhost:8501 |
+| Drift reports | http://localhost:8502 |
+
+---
+
+## What's Next
+
+Things I'd build if this were going to production:
+
+- **Hierarchical forecasting** — reconciling SKU-level forecasts with product-family aggregates top-down and bottom-up, so the numbers don't contradict each other at different levels
+- **Async batch inference** — Celery + Redis for large batches, with job-status polling instead of synchronous waits
+- **Real-time feature serving** — Redis cache so the API doesn't reload the full Parquet on every request
+- **Shadow deployment** — run a candidate model in shadow mode (predictions logged but not served) before the promotion gate fires
+- **N-BEATS / TFT comparison** — a proper deep-learning comparison with the same scientific rigor as the LSTM experiment
 
 ---
 
 ## Resume Line
 
-> Architected an end-to-end supply-chain demand forecasting platform for spare-parts
-> demand across 500 SKUs: engineered 25+ features (lag, rolling, intermittency,
-> stockout-adjusted) in a versioned lightweight feature store; benchmarked seasonal
-> naive, XGBoost, and LightGBM using WAPE, RMSE, bias, and 80% prediction interval
-> coverage; trained quantile LightGBM (P10/P50/P90) with walk-forward cross-validation;
-> served forecasts via FastAPI with model version headers; monitored data, concept, and
-> performance drift with Evidently AI; automated model promotion gate and rollback via
-> MLflow Model Registry and GitHub Actions; documented 5 failure modes and a live drift
-> recovery demo.
+> Architected an end-to-end supply-chain demand forecasting platform for spare-parts demand across 500 SKUs: engineered 25+ features (lag, rolling, intermittency, stockout-adjusted) in a versioned lightweight feature store; benchmarked seasonal naive, XGBoost, and LightGBM using WAPE, RMSE, bias, and 80% prediction interval coverage; trained quantile LightGBM (P10/P50/P90) achieving 34.9% WAPE and 82.6% coverage with walk-forward cross-validation; served forecasts via FastAPI with model version headers; monitored data, concept, and performance drift with Evidently AI; automated model promotion gate and rollback via MLflow Model Registry and GitHub Actions CI/CD.
+
+---
+
+## Tech Stack
+
+`Python 3.11` · `LightGBM` · `XGBoost` · `PyTorch` · `MLflow` · `Evidently AI` · `FastAPI` · `Streamlit` · `Docker Compose` · `GitHub Actions`
