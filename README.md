@@ -7,7 +7,7 @@
 
 ## The Story Behind This Project
 
-Back in 2023, during my internship at Caterpillar, I built a Random Forest model that identified seasonal demand patterns for spare parts. It was rough around the edges — no versioning, no serving layer, no way to detect when the model started going stale — but it worked well enough that procurement teams actually started using its insights in their planning conversations.
+Back in 2023, during my internship at Caterpillar, I built a Random Forest model that identified seasonal demand patterns for spare parts. It was rough around the edges  no versioning, no serving layer, no way to detect when the model started going stale  but it worked well enough that procurement teams actually started using its insights in their planning conversations.
 
 That experience stuck with me. The model was good; the infrastructure around it wasn't. So I rebuilt it from scratch.
 
