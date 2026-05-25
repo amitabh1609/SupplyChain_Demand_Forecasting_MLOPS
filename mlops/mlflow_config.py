@@ -22,7 +22,12 @@ from mlflow.tracking import MlflowClient
 
 logger = logging.getLogger(__name__)
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    "https://dagshub.com/amitabh1609/SupplyChain_Demand_Forecasting_MLOPS.mlflow"
+)
+os.environ.setdefault("MLFLOW_TRACKING_USERNAME", os.getenv("DAGSHUB_USERNAME", "amitabh1609"))
+os.environ.setdefault("MLFLOW_TRACKING_PASSWORD", os.getenv("DAGSHUB_TOKEN", ""))
 EXPERIMENT_BASE = "demand-forecasting"
 REGISTERED_MODEL_NAME = "demand-forecasting-quantile-lgbm"
 
