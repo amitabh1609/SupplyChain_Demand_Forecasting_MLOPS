@@ -1,7 +1,7 @@
 .PHONY: generate-data generate-features train promote up down drift-demo rollback test lint
 
 PYTHON = python
-MLFLOW_URI = http://localhost:5001
+MLFLOW_URI = https://dagshub.com/amitabh1609/SupplyChain_Demand_Forecasting_MLOPS.mlflow
 
 generate-data:
 	$(PYTHON) data/generator/synthetic_demand.py
